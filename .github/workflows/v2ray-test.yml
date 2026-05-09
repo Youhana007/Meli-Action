@@ -1,49 +1,35 @@
-name: Run V2Ray VPN Server with Public Tunnel
+name: Temporary V2Ray Exit Node
 
 on:
-  workflow_dispatch:  # manual trigger
+  workflow_dispatch:   # manual trigger
 
 jobs:
-  vpn-server:
+  tunnel:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # max 6 hours – adjust as needed
+    timeout-minutes: 360   # 6 hours
+
     steps:
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y curl wget unzip jq
+      - name: Generate random UUID for VMess
+        id: genuuid
+        run: echo "UUID=$(uuidgen)" >> $GITHUB_OUTPUT
 
-      - name: Install V2Ray (v2fly)
+      - name: Create V2Ray config
         run: |
-          curl -L -o install-v2ray.sh https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh
-          sudo bash install-v2ray.sh
-          sudo systemctl disable v2ray   # we'll run it manually
-
-      - name: Install bore (TCP tunnel)
-        run: |
-          curl -L -o bore.tar.gz https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
-          tar xzf bore.tar.gz
-          sudo mv bore /usr/local/bin/
-          rm bore.tar.gz
-
-      - name: Generate V2Ray config
-        id: config
-        run: |
-          UUID=$(cat /proc/sys/kernel/random/uuid)
-          LOCAL_PORT=$(shuf -i 10000-60000 -n 1)
-          echo "UUID=$UUID" >> $GITHUB_ENV
-          echo "LOCAL_PORT=$LOCAL_PORT" >> $GITHUB_ENV
-
-          cat > config.json << EOF
+          cat <<EOF > config.json
           {
             "inbounds": [{
-              "port": $LOCAL_PORT,
-              "listen": "0.0.0.0",
+              "port": 10000,
+              "listen": "127.0.0.1",
               "protocol": "vmess",
               "settings": {
-                "clients": [{ "id": "$UUID", "alterId": 0 }]
+                "clients": [{
+                  "id": "${{ steps.genuuid.outputs.UUID }}",
+                  "alterId": 0
+                }]
               },
-              "streamSettings": { "network": "tcp" }
+              "streamSettings": {
+                "network": "tcp"
+              }
             }],
             "outbounds": [{
               "protocol": "freedom",
@@ -51,75 +37,41 @@ jobs:
             }]
           }
           EOF
-          sudo mkdir -p /usr/local/etc/v2ray
-          sudo cp config.json /usr/local/etc/v2ray/config.json
 
-      - name: Start V2Ray server
+      - name: Start V2Ray (Xray) container
         run: |
-          sudo v2ray run -c /usr/local/etc/v2ray/config.json &
-          V2RAY_PID=$!
-          echo $V2RAY_PID > /tmp/v2ray.pid
+          docker run -d --name v2ray \
+            -v ${{ github.workspace }}/config.json:/etc/xray/config.json \
+            -p 127.0.0.1:10000:10000 \
+            teddysun/xray:latest
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/gh_action_key
+          chmod 600 ~/.ssh/gh_action_key
+
+      - name: Establish reverse tunnel
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new \
+              -o ServerAliveInterval=60 \
+              -i ~/.ssh/gh_action_key \
+              -p ${{ secrets.VPS_SSH_PORT }} \
+              -N -R '*:8080:127.0.0.1:10000' \
+              actions@${{ secrets.VPS_HOST }} &
+          echo "SSH tunnel PID: $!"
+          # give it a second to come up
           sleep 2
-          if ! kill -0 $V2RAY_PID 2>/dev/null; then
-            echo "V2Ray failed to start"
-            exit 1
-          fi
 
-      - name: Expose V2Ray via bore tunnel
-        id: bore
+      - name: Print access link
         run: |
-          # Run bore and capture its output (it prints "listening at bore.pub:xxxxx")
-          bore local --to bore.pub --port $LOCAL_PORT 2>&1 | tee /tmp/bore.log &
-          BORE_PID=$!
-          echo $BORE_PID > /tmp/bore.pid
-          sleep 3
-          PUBLIC_URL=$(grep -oP 'listening at \K[^\s]+' /tmp/bore.log | head -1)
-          if [ -z "$PUBLIC_URL" ]; then
-            sleep 5
-            PUBLIC_URL=$(grep -oP 'listening at \K[^\s]+' /tmp/bore.log | head -1)
-          fi
-          if [ -z "$PUBLIC_URL" ]; then
-            echo "Failed to obtain bore tunnel URL"
-            exit 1
-          fi
-          echo "PUBLIC_URL=$PUBLIC_URL" >> $GITHUB_ENV
-          echo "::notice title=Bore tunnel::Public address: $PUBLIC_URL"
+          UUID='${{ steps.genuuid.outputs.UUID }}'
+          DOMAIN='${{ secrets.VPS_DOMAIN }}'
+          # Build a VMess link (base64-encoded JSON)
+          JSON=$(printf '{"v":"2","ps":"GitHubActions","add":"%s","port":"8080","id":"%s","aid":"0","net":"tcp","type":"none","host":"","path":"","tls":""}' "$DOMAIN" "$UUID")
+          BASE64=$(echo -n "$JSON" | base64 -w0)
+          echo "vmess://$BASE64"
+          echo "::notice::Your temporary VPN link: vmess://$BASE64"
 
-      - name: Generate V2Ray client URL
-        run: |
-          HOST=$(echo $PUBLIC_URL | cut -d: -f1)
-          PORT=$(echo $PUBLIC_URL | cut -d: -f2)
-          VMESS_JSON=$(jq -n \
-            --arg v "2" \
-            --arg ps "GitHubActions-V2Ray" \
-            --arg add "$HOST" \
-            --arg port "$PORT" \
-            --arg id "$UUID" \
-            --arg aid "0" \
-            --arg net "tcp" \
-            --arg type "none" \
-            --arg tls "none" \
-            '{v: $v, ps: $ps, add: $add, port: $port, id: $id, aid: $aid, net: $net, type: $type, tls: $tls}')
-          ENCODED=$(echo -n "$VMESS_JSON" | base64 -w 0)
-          VMESS_URL="vmess://$ENCODED"
-          echo "VMESS_URL=$VMESS_URL" >> $GITHUB_ENV
-          echo "========================================="
-          echo "✅ V2Ray VPN Server is running!"
-          echo "🔗 Access Point URL: $VMESS_URL"
-          echo "========================================="
-
-      - name: Keep server running until timeout
-        run: |
-          echo "Server will stay alive until job timeout (max 6h) or manual cancel."
-          echo "Press Ctrl+C to stop early (if testing locally)."
-          while true; do
-            if ! kill -0 $(cat /tmp/v2ray.pid) 2>/dev/null; then
-              echo "V2Ray process died" >&2
-              exit 1
-            fi
-            if ! kill -0 $(cat /tmp/bore.pid) 2>/dev/null; then
-              echo "Bore tunnel process died" >&2
-              exit 1
-            fi
-            sleep 60
-          done
+      - name: Keep alive until timeout
+        run: sleep infinity
